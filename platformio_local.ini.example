@@ -1,0 +1,8 @@
+; Machine-specific overrides (not committed). Copy to platformio_local.ini:
+;   copy platformio_local.ini.example platformio_local.ini
+;
+; Use when auto-detect picks the wrong port or your CP210x is not COM9.
+
+[env]
+upload_port = COM9
+monitor_port = COM9
