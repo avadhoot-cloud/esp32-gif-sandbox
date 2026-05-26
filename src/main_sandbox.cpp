@@ -28,10 +28,13 @@ static size_t chunkExpected = 0;
 static size_t chunkReceived = 0;
 static size_t uploadTotal = 0;
 static size_t uploadReceived = 0;
+static unsigned long uploadLastActivityMs = 0;
 static String jsonLine;
 static String uploadPath;
 
 static const size_t SERIAL_RX_BUF = 16384;
+static const unsigned long UPLOAD_CHUNK_TIMEOUT_MS = 10000;
+static const char* LAST_GIF_PATH_FILE = "/last_gif.txt";
 
 static void protocolReply(const String& json) {
     Serial.println(json);
@@ -46,7 +49,15 @@ static void tftInit(uint8_t rotation) {
     tft.setSwapBytes(false);
 }
 
+static void GIFDraw(GIFDRAW* pDraw);
+static void* gifOpen(const char* fname, int32_t* pSize);
+static void gifClose(void* pHandle);
+static int32_t gifRead(GIFFILE* pFile, uint8_t* pBuf, int32_t iLen);
+static int32_t gifSeek(GIFFILE* pFile, int32_t iPosition);
+static void stopGif();
+
 static void runTftBaseline() {
+    stopGif();
     tftInit(1);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextSize(2);
@@ -59,19 +70,17 @@ static void runTftBaseline() {
     tft.fillCircle(120, 180, 30, TFT_BLUE);
 }
 
-static void GIFDraw(GIFDRAW* pDraw);
-static void* gifOpen(const char* fname, int32_t* pSize);
-static void gifClose(void* pHandle);
-static int32_t gifRead(GIFFILE* pFile, uint8_t* pBuf, int32_t iLen);
-static int32_t gifSeek(GIFFILE* pFile, int32_t iPosition);
+static void stopGif() {
+    if (!gifPlaying) return;
+    gif.close();
+    gifPlaying = false;
+    if (gifFile) gifFile.close();
+    tft.endWrite();
+}
 
 static bool openGif(const char* path) {
-    if (gifPlaying) {
-        gif.close();
-        gifPlaying = false;
-        if (gifFile) gifFile.close();
-        tft.endWrite();
-    }
+    stopGif();
+    tft.fillScreen(TFT_BLACK);
     gif.begin(BIG_ENDIAN_PIXELS);
     if (!gif.open(path, gifOpen, gifClose, gifRead, gifSeek, GIFDraw)) {
         return false;
@@ -81,6 +90,48 @@ static bool openGif(const char* path) {
     tft.startWrite();
     gifPlaying = true;
     return true;
+}
+
+static void saveLastGifPath(const String& path) {
+    File f = LittleFS.open(LAST_GIF_PATH_FILE, "w");
+    if (!f) return;
+    f.print(path);
+    f.close();
+}
+
+static String readLastGifPath() {
+    File f = LittleFS.open(LAST_GIF_PATH_FILE, "r");
+    if (!f) return "";
+    String path = f.readString();
+    f.close();
+    path.trim();
+    return path;
+}
+
+static String findFirstGifPath() {
+    File root = LittleFS.open("/");
+    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+        String name = f.name();
+        if (!name.startsWith("/")) name = "/" + name;
+        if (name.endsWith(".gif") || name.endsWith(".GIF")) return name;
+    }
+    return "";
+}
+
+static bool autoplayStoredGif() {
+    String path = readLastGifPath();
+    if (path.length() && openGif(path.c_str())) {
+        Serial.printf("[sandbox] autoplay %s\n", path.c_str());
+        return true;
+    }
+
+    path = findFirstGifPath();
+    if (path.length() && openGif(path.c_str())) {
+        saveLastGifPath(path);
+        Serial.printf("[sandbox] autoplay first gif %s\n", path.c_str());
+        return true;
+    }
+    return false;
 }
 
 static void updateGif() {
@@ -103,12 +154,7 @@ static void updateGif() {
 }
 
 static bool formatFs() {
-    if (gifPlaying) {
-        gif.close();
-        gifPlaying = false;
-        if (gifFile) gifFile.close();
-        tft.endWrite();
-    }
+    stopGif();
     LittleFS.end();
     if (!LittleFS.format()) return false;
     return LittleFS.begin(false);
@@ -162,18 +208,14 @@ static void handleCommand(const String& line) {
         String p = file ? String(file) : "";
         if (!p.startsWith("/")) p = "/" + p;
         if (openGif(p.c_str())) {
+            saveLastGifPath(p);
             Serial.printf("[sandbox] playing %s rot=%u baud=%d\n", p.c_str(), tftRotation, SANDBOX_SERIAL_BAUD);
             protocolReply("{\"status\":\"success\",\"message\":\"playing\"}");
         } else {
             protocolReply("{\"status\":\"error\",\"message\":\"play failed\"}");
         }
     } else if (c == "START_UPLOAD") {
-        if (gifPlaying) {
-            gif.close();
-            gifPlaying = false;
-            if (gifFile) gifFile.close();
-            tft.endWrite();
-        }
+        stopGif();
         const char* file = doc["file"];
         uploadTotal = doc["size"] | 0;
         if (!file || !uploadTotal) {
@@ -189,6 +231,7 @@ static void handleCommand(const String& line) {
         }
         uploadReceived = 0;
         uploadActive = true;
+        uploadLastActivityMs = millis();
         protocolReply("{\"status\":\"success\",\"message\":\"ready for chunks\"}");
     } else if (c == "CHUNK") {
         if (!uploadActive) {
@@ -198,6 +241,7 @@ static void handleCommand(const String& line) {
         chunkExpected = doc["size"] | 0;
         chunkReceived = 0;
         binaryMode = true;
+        uploadLastActivityMs = millis();
         protocolReply("{\"status\":\"success\",\"message\":\"send chunk\"}");
     } else if (c == "END_UPLOAD") {
         uploadFile.close();
@@ -207,6 +251,8 @@ static void handleCommand(const String& line) {
             LittleFS.remove(uploadPath.c_str());
             protocolReply("{\"status\":\"error\",\"message\":\"size mismatch\"}");
         } else {
+            saveLastGifPath(uploadPath);
+            openGif(uploadPath.c_str());
             protocolReply("{\"status\":\"success\",\"message\":\"upload complete\"}");
         }
     } else {
@@ -219,15 +265,19 @@ void setup() {
     Serial.begin(SANDBOX_SERIAL_BAUD);
     delay(200);
 
-    runTftBaseline();
+    tftInit(1);
 
     Serial.printf("\n[sandbox] baud=%d rot=%u\n", SANDBOX_SERIAL_BAUD, tftRotation);
-    Serial.println("[sandbox] TFT MOSI=25 SCK=14 DC=27 RST=12 BL=13 CS=none");
+    Serial.println("[sandbox] TFT MOSI=23 SCK=18 DC=4 RST=2 BL=3V3 CS=none");
 
     if (!LittleFS.begin(true)) {
         Serial.println("[sandbox] LittleFS failed");
+        runTftBaseline();
     } else {
         Serial.println("[sandbox] LittleFS ok");
+        if (!autoplayStoredGif()) {
+            runTftBaseline();
+        }
     }
     Serial.println("[sandbox] ready");
 }
@@ -235,6 +285,12 @@ void setup() {
 void loop() {
     if (!uploadActive) {
         updateGif();
+    } else if (binaryMode && millis() - uploadLastActivityMs > UPLOAD_CHUNK_TIMEOUT_MS) {
+        uploadFile.close();
+        LittleFS.remove(uploadPath.c_str());
+        uploadActive = false;
+        binaryMode = false;
+        protocolReply("{\"status\":\"error\",\"message\":\"chunk timeout\"}");
     }
 
     while (Serial.available()) {
@@ -247,6 +303,7 @@ void loop() {
                 uploadFile.write(buf, n);
                 uploadReceived += n;
                 chunkReceived += n;
+                uploadLastActivityMs = millis();
             }
             if (chunkReceived >= chunkExpected) {
                 binaryMode = false;
@@ -275,11 +332,28 @@ static void GIFDraw(GIFDRAW* pDraw) {
     int y = pDraw->iY + pDraw->y + gifYOff;
     int x = pDraw->iX + gifXOff;
     int w = pDraw->iWidth;
+    int srcOffset = 0;
     if (y < 0 || y >= tft.height() || x >= tft.width() || w < 1) return;
+    if (x < 0) {
+        srcOffset = -x;
+        w -= srcOffset;
+        x = 0;
+    }
+    if (w < 1) return;
     if (x + w > tft.width()) w = tft.width() - x;
+    if (w > (int)(sizeof(lineBuf) / sizeof(lineBuf[0]))) {
+        w = sizeof(lineBuf) / sizeof(lineBuf[0]);
+    }
 
-    uint8_t* s = pDraw->pPixels;
+    uint8_t* s = pDraw->pPixels + srcOffset;
     uint16_t* pal = pDraw->pPalette;
+
+    if (pDraw->ucDisposalMethod == 2) {
+        for (int i = 0; i < w; i++) {
+            if (s[i] == pDraw->ucTransparent) s[i] = pDraw->ucBackground;
+        }
+        pDraw->ucHasTransparency = 0;
+    }
 
     if (pDraw->ucHasTransparency) {
         uint8_t* end = s + w;

@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "tools" / "results"
 
 BAUDS = [115200, 460800, 921600]
-CHUNK_SIZES = [512, 1024, 2048]
+DEFAULT_CHUNK_SIZES = [1024]
 SETTLE_S = 0.05
 READ_TIMEOUT = 2.0
 
@@ -79,13 +79,13 @@ def expect_message(ser: serial.Serial, message: str, timeout: float = 30.0) -> t
     return False, "timeout"
 
 
-def upload_file(ser: serial.Serial, data: bytes, chunk_size: int) -> tuple[bool, str]:
+def upload_file(ser: serial.Serial, data: bytes, chunk_size: int, remote_name: str) -> tuple[bool, str]:
     write_line(ser, {"cmd": "FORMAT_FS"})
     ok, detail = expect_message(ser, "formatted", 10)
     if not ok:
         return False, f"format:{detail}"
 
-    write_line(ser, {"cmd": "START_UPLOAD", "file": "sample.gif", "size": len(data)})
+    write_line(ser, {"cmd": "START_UPLOAD", "file": remote_name, "size": len(data)})
     ok, detail = expect_message(ser, "ready for chunks", 10)
     if not ok:
         return False, f"start:{detail}"
@@ -118,13 +118,24 @@ def upload_file(ser: serial.Serial, data: bytes, chunk_size: int) -> tuple[bool,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", default="COM9")
-    parser.add_argument("--gif", default=str(ROOT / "assets" / "sample.gif"))
+    parser.add_argument("--gif", default=str(ROOT / "assets" / "sample_240.gif"))
     parser.add_argument("--baud", type=int, default=0, help="Single baud (0 = use firmware default only)")
+    parser.add_argument("--chunks", default="1024", help="Comma-separated chunk sizes to test")
+    parser.add_argument("--no-play", action="store_true", help="Do not start GIF playback after each upload")
     args = parser.parse_args()
+    try:
+        chunk_sizes = [int(c.strip()) for c in args.chunks.split(",") if c.strip()]
+    except ValueError:
+        print(f"Bad --chunks value: {args.chunks}")
+        return 1
+    if not chunk_sizes:
+        chunk_sizes = DEFAULT_CHUNK_SIZES
 
     gif_path = Path(args.gif)
     if not gif_path.is_file():
+        fallback = ROOT / "assets" / "sample.gif"
         print(f"GIF not found: {gif_path}")
+        print(f"Create it with: python tools/prepare_gif.py {fallback} {gif_path}")
         return 1
 
     data = gif_path.read_bytes()
@@ -146,11 +157,19 @@ def main() -> int:
         time.sleep(2)
         ser.reset_input_buffer()
 
-        for chunk in CHUNK_SIZES:
+        for chunk in chunk_sizes:
             print(f"  chunk={chunk} ... ", end="", flush=True)
             t0 = time.time()
-            ok, detail = upload_file(ser, data, chunk)
+            ok, detail = upload_file(ser, data, chunk, gif_path.name)
             elapsed = round(time.time() - t0, 1)
+            bytes_per_second = round(len(data) / elapsed, 1) if elapsed else 0
+            kbps = round((len(data) * 8) / elapsed / 1000, 1) if elapsed else 0
+            if ok and not args.no_play:
+                write_line(ser, {"cmd": "PLAY_GIF", "file": gif_path.name})
+                play_ok, play_detail = expect_message(ser, "playing", 10)
+                if not play_ok:
+                    ok = False
+                    detail = f"play:{play_detail}"
             row = {
                 "baud": baud,
                 "chunk_size": chunk,
@@ -158,9 +177,12 @@ def main() -> int:
                 "detail": detail,
                 "seconds": elapsed,
                 "bytes": len(data),
+                "bytes_per_second": bytes_per_second,
+                "kilobits_per_second": kbps,
             }
             results.append(row)
-            print("PASS" if ok else f"FAIL ({detail}) in {elapsed}s")
+            rate = f"{bytes_per_second:.1f} B/s ({kbps:.1f} kbps)"
+            print(("PASS" if ok else f"FAIL ({detail})") + f" in {elapsed}s, {rate}")
 
         ser.close()
 

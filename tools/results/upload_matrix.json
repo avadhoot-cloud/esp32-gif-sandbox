@@ -1,0 +1,12 @@
+[
+  {
+    "baud": 115200,
+    "chunk_size": 1024,
+    "ok": true,
+    "detail": "ok",
+    "seconds": 4.5,
+    "bytes": 22534,
+    "bytes_per_second": 5007.6,
+    "kilobits_per_second": 40.1
+  }
+]
