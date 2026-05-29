@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 GIF Sandbox</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Arial, sans-serif;
+      background: #f4f4f2;
+      color: #1f2528;
+    }
+
+    body {
+      margin: 0;
+      padding: 24px;
+    }
+
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      margin: 0 0 20px;
+      font-size: 24px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 90px minmax(160px, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 14px 0;
+      border-top: 1px solid #d3d6d2;
+    }
+
+    label {
+      font-weight: 700;
+    }
+
+    select,
+    button {
+      min-height: 38px;
+      font: inherit;
+      border: 1px solid #9da39d;
+      border-radius: 6px;
+      background: #fff;
+      color: #1f2528;
+    }
+
+    select {
+      padding: 0 10px;
+    }
+
+    button {
+      padding: 0 14px;
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: #145c4a;
+      border-color: #145c4a;
+      color: #fff;
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    #toast-stack {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      display: grid;
+      gap: 10px;
+      width: min(520px, calc(100vw - 32px));
+      z-index: 10;
+    }
+
+    .toast {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #fff;
+      border-left: 6px solid #145c4a;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+      overflow-wrap: anywhere;
+    }
+
+    .toast.error {
+      border-left-color: #b3261e;
+    }
+
+    .toast-title {
+      font-weight: 700;
+    }
+
+    .toast pre {
+      max-height: 180px;
+      margin: 0;
+      overflow: auto;
+      white-space: pre-wrap;
+      font-size: 12px;
+    }
+
+    .toast-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: end;
+    }
+
+    @media (max-width: 560px) {
+      body {
+        padding: 16px;
+      }
+
+      .row {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        background: #171b1d;
+        color: #eef1ee;
+      }
+
+      .row {
+        border-top-color: #343b3f;
+      }
+
+      select,
+      button,
+      .toast {
+        background: #22282b;
+        color: #eef1ee;
+        border-color: #596166;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ESP32 GIF Sandbox</h1>
+
+    <section class="row" aria-label="GIF">
+      <label for="gif-mode">GIF</label>
+      <select id="gif-mode">
+        <option value="usb">USB</option>
+        <option value="bluetooth">Bluetooth</option>
+        <option value="wifi">Wi-Fi</option>
+      </select>
+      <button class="primary" id="gif-run" type="button">Run</button>
+    </section>
+
+    <section class="row" aria-label="Image">
+      <label for="image-mode">Image</label>
+      <select id="image-mode">
+        <option value="usb">USB</option>
+        <option value="bluetooth">Bluetooth</option>
+        <option value="wifi">Wi-Fi</option>
+      </select>
+      <button class="primary" id="image-run" type="button">Run</button>
+    </section>
+  </main>
+
+  <div id="toast-stack" aria-live="polite" aria-atomic="true"></div>
+
+  <script>
+    const GIF_SOURCE = {
+      url: "assets/motion_test_240.gif",
+      remoteName: "motion_test_240.gif",
+    };
+    const IMAGE_SOURCE = {
+      url: "assets/images/northen lights.jpg",
+      remoteName: "northen lights.jpg",
+    };
+    const BAUD_RATE = 115200;
+    const CHUNK_SIZE = 1024;
+
+    let serialPort;
+    let serialReader;
+    let serialWriter;
+    let serialBuffer = "";
+    const messageQueue = [];
+    const messageWaiters = [];
+
+    const buttons = [...document.querySelectorAll("button")];
+    const gifMode = document.querySelector("#gif-mode");
+    const imageMode = document.querySelector("#image-mode");
+
+    document.querySelector("#gif-run").addEventListener("click", () => {
+      runTask("gif", gifMode.value).catch((error) => showFailure(error));
+    });
+    document.querySelector("#image-run").addEventListener("click", () => {
+      runTask("image", imageMode.value).catch((error) => showFailure(error));
+    });
+
+    async function runTask(kind, mode) {
+      setBusy(true);
+      try {
+        if (kind === "gif" && mode === "usb") {
+          await runGifUsb();
+          showSuccess("GIF USB upload and playback succeeded.");
+          return;
+        }
+        throw unsupportedError(kind, mode);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function runGifUsb() {
+      const data = new Uint8Array(await fetchBytes(GIF_SOURCE.url));
+      await ensureSerial();
+      await uploadGif(data, GIF_SOURCE.remoteName);
+    }
+
+    async function fetchBytes(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`Asset fetch failed: ${url}: HTTP ${response.status} ${response.statusText}`);
+      }
+      return response.arrayBuffer();
+    }
+
+    async function ensureSerial() {
+      if (!("serial" in navigator)) {
+        throw new Error("USB unsupported: Web Serial API unavailable. Use Chrome or Edge from http://localhost or https.");
+      }
+      if (!serialPort) {
+        serialPort = await navigator.serial.requestPort();
+      }
+      if (!serialWriter) {
+        await serialPort.open({ baudRate: BAUD_RATE, bufferSize: 16384 });
+        serialWriter = serialPort.writable.getWriter();
+        serialReader = serialPort.readable.getReader();
+        readSerialLoop();
+      }
+    }
+
+    async function readSerialLoop() {
+      const decoder = new TextDecoder();
+      try {
+        for (;;) {
+          const { value, done } = await serialReader.read();
+          if (done) return;
+          serialBuffer += decoder.decode(value, { stream: true });
+          let index = serialBuffer.search(/[\r\n]/);
+          while (index >= 0) {
+            const line = serialBuffer.slice(0, index).trim();
+            serialBuffer = serialBuffer.slice(index + 1);
+            if (line.startsWith("{")) {
+              pushMessage(parseLine(line));
+            }
+            index = serialBuffer.search(/[\r\n]/);
+          }
+        }
+      } catch (error) {
+        pushMessage({ status: "error", message: `serial read failed: ${formatError(error)}` });
+      }
+    }
+
+    function parseLine(line) {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return { status: "error", message: `corrupt serial json: ${line}` };
+      }
+    }
+
+    function pushMessage(message) {
+      const waiter = messageWaiters.shift();
+      if (waiter) waiter(message);
+      else messageQueue.push(message);
+    }
+
+    async function nextMessage(timeoutMs) {
+      if (messageQueue.length) return messageQueue.shift();
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const index = messageWaiters.indexOf(done);
+          if (index >= 0) messageWaiters.splice(index, 1);
+          reject(new Error(`serial response timeout after ${timeoutMs}ms`));
+        }, timeoutMs);
+        function done(message) {
+          clearTimeout(timer);
+          resolve(message);
+        }
+        messageWaiters.push(done);
+      });
+    }
+
+    async function writeLine(payload) {
+      const text = JSON.stringify(payload) + "\n";
+      await serialWriter.write(new TextEncoder().encode(text));
+    }
+
+    async function expectMessage(expected, timeoutMs) {
+      for (;;) {
+        const message = await nextMessage(timeoutMs);
+        if (message.status === "success" && message.message === expected) return message;
+        if (message.status === "error") {
+          throw new Error(message.message || "firmware returned error");
+        }
+      }
+    }
+
+    async function uploadGif(data, remoteName) {
+      await writeLine({ cmd: "FORMAT_FS" });
+      await expectMessage("formatted", 10000);
+
+      await writeLine({ cmd: "START_UPLOAD", file: remoteName, size: data.length });
+      await expectMessage("ready for chunks", 10000);
+
+      for (let offset = 0; offset < data.length; offset += CHUNK_SIZE) {
+        const chunk = data.slice(offset, offset + CHUNK_SIZE);
+        await writeLine({ cmd: "CHUNK", size: chunk.length });
+        await expectMessage("send chunk", 30000);
+        await serialWriter.write(chunk);
+        await expectMessage("chunk received", 60000);
+      }
+
+      await writeLine({ cmd: "END_UPLOAD" });
+      await expectMessage("upload complete", 15000);
+
+      await writeLine({ cmd: "PLAY_GIF", file: remoteName });
+      await expectMessage("playing", 10000);
+    }
+
+    function unsupportedError(kind, mode) {
+      if (kind === "image") {
+        return new Error(`Unsupported ${kind.toUpperCase()} ${mode.toUpperCase()}: current firmware exposes GIF-only commands (FORMAT_FS, START_UPLOAD, CHUNK, END_UPLOAD, LIST_GIFS, PLAY_GIF). No image decode/display command exists for ${IMAGE_SOURCE.remoteName}.`);
+      }
+      return new Error(`Unsupported GIF ${mode.toUpperCase()}: current firmware has no Bluetooth or Wi-Fi transport protocol. Existing supported path is USB serial at ${BAUD_RATE} baud.`);
+    }
+
+    function setBusy(isBusy) {
+      buttons.forEach((button) => {
+        button.disabled = isBusy;
+      });
+    }
+
+    function showSuccess(text) {
+      showToast("Success", text, false);
+    }
+
+    function showFailure(error) {
+      showToast("Failure", formatError(error), true);
+    }
+
+    function showToast(title, text, isError) {
+      const toast = document.createElement("div");
+      toast.className = `toast${isError ? " error" : ""}`;
+      const body = isError ? `<pre></pre>` : `<div></div>`;
+      toast.innerHTML = `
+        <div class="toast-title"></div>
+        ${body}
+        <div class="toast-actions">
+          ${isError ? '<button type="button" data-copy>Copy</button>' : ""}
+          <button type="button" data-close>Close</button>
+        </div>
+      `;
+      toast.querySelector(".toast-title").textContent = title;
+      const textNode = toast.querySelector("pre, .toast > div:not(.toast-title):not(.toast-actions)");
+      textNode.textContent = text;
+      toast.querySelector("[data-close]").addEventListener("click", () => toast.remove());
+      const copy = toast.querySelector("[data-copy]");
+      if (copy) {
+        copy.addEventListener("click", async () => {
+          try {
+            await copyText(text);
+            copy.textContent = "Copied";
+          } catch (error) {
+            copy.textContent = "Copy failed";
+            showToast("Failure", `Copy failed: ${formatError(error)}\n\nOriginal error:\n${text}`, true);
+          }
+        });
+      }
+      document.querySelector("#toast-stack").appendChild(toast);
+      if (!isError) setTimeout(() => toast.remove(), 5000);
+    }
+
+    async function copyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      textarea.remove();
+      if (!copied) throw new Error("document.execCommand('copy') returned false");
+    }
+
+    function formatError(error) {
+      if (error && error.stack) return error.stack;
+      if (error && error.message) return error.message;
+      return String(error);
+    }
+  </script>
+</body>
+</html>
